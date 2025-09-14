@@ -1,0 +1,507 @@
+问题：
+1、修复位置跟崩溃位置不同，只给出崩溃代码上下文不足以修复；而若要给出修复位置则提供了错误修复之前不应该有的先验知识，不太合理；这样似乎只能给出项目全部代码，但是输入词太多也会造成问题；选择用代码覆盖采集的方法
+2、修复提交相较于修复父提交的改动和修复提交相较于错误提交的改动不同，如果把单次的补丁应用在错误版本上，poc可能会有问题，不过问题应该不大
+3、脚本有时候正常运行有时候报错段错误，不知道是什么原因，是随机种子造成的吗？
+4、sanitizer-coverage的方法文本也太多19w字符，llm输入存在限制
+
+
+714
+弄清示例中patch和log的关系，静态动态分析
+1、补丁能否修复错误
+2、完整函数调用
+3、scripts
+
+补丁不能修复错误
+grep -n 'xmlAddChild' -n /src/libxml2/SAX2.c | sed -n '2800,2820p'
+grep -n 'xmlAddChild' /src/libxml2/SAX2.c
+sed -n '2800,2820p' SAX2.c
+sed -n '6540,6560p' elfgcchack.h
+git status
+git diff --stat
+
+git rev-parse HEAD
+e905f08123e4a6e7731549e6f09dadff4cab65bd
+git diff e905f08123e4a6e7731549e6f09dadff4cab65bd
+git diff --stat e905f08123e4a6e7731549e6f09dadff4cab65bd
+Diff between e905f08123e4a6e7731549e6f09dadff4cab65bd and 074180119fc90d5fd04ef9e8a5ee1910d6f9ad8e
+git diff --stat 074180119fc90d5fd04ef9e8a5ee1910d6f9ad8e
+
+git diff COMMIT_ID_1 COMMIT_ID_2 > diff.patch
+git diff e905f08123e4a6e7731549e6f09dadff4cab65bd 074180119fc90d5fd04ef9e8a5ee1910d6f9ad8e > diff.patch
+
+
+
+1、补丁成功应用：
+SAX2.c                    |  3 ++-
+ elfgcchack.h              | 10 ++++++++++
+ include/libxml/parser.h   |  3 ++-
+ include/libxml/xmlIO.h    |  8 ++++++++
+ include/libxml/xmlerror.h |  1 +
+ nanohttp.c                |  4 ++--
+ parser.c                  | 13 +++++++++++++
+ python/setup.py           |  2 +-
+ xmlIO.c                   | 40 +++++++++++++++++++++++++++++++++++-----
+ xmllint.c                 |  5 +++++
+ 10 files changed, 79 insertions(+), 10 deletions(-)
+2、文件编译进去了：
+  CC       relaxng.lo
+  CC       dict.lo
+  CC       SAX2.lo
+SAX2.c:2808:9: warning: #warning is a language extension [-Wpedantic]
+       #warning ">>> Compiling SAX2.c with PATCH <<<"
+        ^
+SAX2.c:2808:9: warning: ">>> Compiling SAX2.c with PATCH <<<" [-W#warnings]
+2 warnings generated.
+  CC       xmlwriter.lo
+  CC       legacy.lo
+  CC       chvalid.lo
+3、问题1，缺py改动：@@ -8,7 +8,7 @@ from distutils.core import setup, Extension
+ # Below ROOT, we expect to find include, include/libxml2, lib and bin.
+ # On *nix, it is not needed (but should not harm),
+ # on Windows, it is set by configure.js.
+-ROOT = r'/usr'
++ROOT = r'/usr/local'
+
+ # Thread-enabled libxml2
+ with_threads = 1
+不过fix版重编译也会setup改变
+
+问题2、空格制表符变化
+
+4、构建代码：
+root@a56acb38ccd6:/# which arvo compile
+/bin/arvo
+/usr/local/bin/compile
+root@a56acb38ccd6:/# cat /usr/local/bin/compile
+#!/bin/bash -eu
+# Copyright 2016 Google Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+################################################################################
+
+echo "---------------------------------------------------------------"
+
+if [ -z "${SANITIZER_FLAGS-}" ]; then
+  FLAGS_VAR="SANITIZER_FLAGS_${SANITIZER}"
+  export SANITIZER_FLAGS=$(echo ${!FLAGS_VAR})
+fi
+
+# compile script might override environment, use . to call it.
+. compile_${FUZZING_ENGINE}
+
+if [[ $SANITIZER_FLAGS = *sanitize=memory* ]]
+then
+  # Take all libraries from lib/msan
+  # export CXXFLAGS_EXTRA="-L/usr/msan/lib $CXXFLAGS_EXTRA"
+  cp -R /usr/msan/lib/* /usr/lib/
+fi
+
+export CFLAGS="$CFLAGS $SANITIZER_FLAGS $COVERAGE_FLAGS"
+export CXXFLAGS="$CFLAGS $CXXFLAGS_EXTRA"
+
+
+echo "CC=$CC"
+echo "CXX=$CXX"
+echo "CFLAGS=$CFLAGS"
+echo "CXXFLAGS=$CXXFLAGS"
+
+echo "---------------------------------------------------------------"
+
+BUILD_CMD="bash -eux $SRC/build.sh"
+if [ "${BUILD_UID-0}" -ne "0" ]; then
+  adduser -u $BUILD_UID --disabled-password --gecos '' builder
+  chown -R builder $SRC $OUT $WORK
+  su -c "$BUILD_CMD" builder
+else
+  $BUILD_CMD
+fi
+root@a56acb38ccd6:/# cat /src/build.sh
+
+./autogen.sh
+./configure
+make -j$(nproc) clean
+make -j$(nproc) all
+for fuzzer in libxml2_xml_read_memory_fuzzer libxml2_xml_regexp_compile_fuzzer; do
+  $CXX $CXXFLAGS -std=c++11 -Iinclude/       $SRC/$fuzzer.cc -o $OUT/$fuzzer       -lFuzzingEngine .libs/libxml2.a
+done
+cp $SRC/*.dict $SRC/*.options $OUT/
+root@6bda5bd2f3b7:/src/libxml2# cat /bin/arvo
+#!/bin/bash
+export ASAN_OPTIONS=alloc_dealloc_mismatch=0:allocator_may_return_null=1:allocator_release_to_os_interval_ms=500:check_malloc_usable_size=0:detect_container_overflow=1:detect_odr_violation=0:detect_leaks=0:detect_stack_use_after_return=1:fast_unwind_on_fatal=0:handle_abort=1:handle_segv=1:handle_sigill=1:max_uar_stack_size_log=16:print_scariness=1:quarantine_size_mb=10:strict_memcmp=1:strip_path_prefix=/workspace/:symbolize=1:use_sigaltstack=1:dedup_token_length=3
+export MSAN_OPTIONS=print_stats=1:strip_path_prefix=/workspace/:symbolize=1:dedup_token_length=3
+export UBSAN_OPTIONS=print_stacktrace=1:print_summary=1:silence_unsigned_overflow=1:strip_path_prefix=/workspace/:symbolize=1:dedup_token_length=3
+export FUZZER_ARGS="-rss_limit_mb=2560 -timeout=25"
+export AFL_FUZZER_ARGS="-m none"
+export FUZZING_ENGINE=libfuzzer
+export SANITIZER=memory
+export ARCHITECTURE=x86_64
+export FUZZING_LANGUAGE=c++
+
+if [ "$#" -ge 1 ]; then
+# Get the first parameter
+first_param="$1"
+
+if [ "$first_param" = "compile" ]; then
+    compile
+elif [ "$first_param" = "run" ]; then
+    /out/libxml2_xml_read_memory_fuzzer /tmp/poc
+
+else
+    echo "Unknown command: $first_param"
+fi
+    else
+        /out/libxml2_xml_read_memory_fuzzer /tmp/poc
+
+fi
+
+
+
+
+5、结论：跟补丁无关，arvo compile怎么样poc都会正常崩溃，但是只要compile，无论先后都不会报错（跟已修复的结果一样）
+compile arvo_poc_ok
+compile arvo_compile arvo_poc_no 
+要找对cwd不然编译报错
+（刚开始没有）编译产物.libs，（刚开始有）fuzzer二进制/out
+ > /dev/null 2>&1
+编译工具的库都不一样
+
+container-diff diff <img1> <img2> --type=file
+container-diff diff n132/arvo:42470114-vul n132/arvo:42470114-fix --type=file
+
+xiaoran@vuln-analysis-vm:/mnt/sdb/oss-fuzz/arvo/ARVO-Meta/scripts$ docker run -it n132/arvo:42470114-vul bash
+root@abf2b6973318:/src/libxml2# git checkout 074180119fc90d5fd04ef9e8a5ee1910d6f9ad8e
+Note: checking out '074180119fc90d5fd04ef9e8a5ee1910d6f9ad8e'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by performing another checkout.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -b with the checkout command again. Example:
+
+  git checkout -b <new-branch-name>
+
+HEAD is now at 0741801... Do not leak the new CData node if adding fails
+root@abf2b6973318:/src/libxml2# arvo compile  > /dev/null 2>&1
+root@abf2b6973318:/src/libxml2# exit
+exit
+xiaoran@vuln-analysis-vm:/mnt/sdb/oss-fuzz/arvo/ARVO-Meta/scripts$ docker run -it n132/arvo:42470114-fix bash
+root@76c251e36c26:/src/libxml2# arvo compile  > /dev/null 2>&1
+root@76c251e36c26:/src/libxml2# exit
+exit
+xiaoran@vuln-analysis-vm:/mnt/sdb/oss-fuzz/arvo/ARVO-Meta/scripts/dockers$ docker run -it n132/arvo:42470114-vul bash
+root@b7a2ac9bb0d1:/src/libxml2# arvo compile  > /dev/null 2>&1
+root@b7a2ac9bb0d1:/src/libxml2# exit
+exit
+
+docker export abf2b6973318 -o abf2b6973318.tar
+docker export 76c251e36c26 -o 76c251e36c26.tar
+docker export b7a2ac9bb0d1 -o b7a2ac9bb0d1.tar
+tar --exclude=dev/* -xf abf2b6973318.tar -C abf2b6973318
+tar --exclude=dev/* -xf 76c251e36c26.tar -C 76c251e36c26
+tar --exclude=dev/* -xf b7a2ac9bb0d1.tar -C b7a2ac9bb0d1
+diff -qr abf2b6973318 76c251e36c26
+diff -qr abf2b6973318 b7a2ac9bb0d1
+
+静态分析结果
+补丁应用-》git切换-》编译产物-》编译库不同
+xiaoran@vuln-analysis-vm:/mnt/sdb/oss-fuzz/arvo/ARVO-Meta/scripts/dockers$ docker exec -it abf2b6973318 bash
+root@abf2b6973318:/src/libxml2# clang --version
+clang version 5.0.0 (http://llvm.org/git/clang.git f775d2428cdd767d2186d8d24e808c5252d40a3b) (http://llvm.org/git/llvm.git 7c1642caaf1a886fe1f6fa4415ab84aa7f360d63)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /usr/local/bin
+root@abf2b6973318:/src/libxml2# exit
+exit
+xiaoran@vuln-analysis-vm:/mnt/sdb/oss-fuzz/arvo/ARVO-Meta/scripts/dockers$ docker start 76c251e36c26
+76c251e36c26
+xiaoran@vuln-analysis-vm:/mnt/sdb/oss-fuzz/arvo/ARVO-Meta/scripts/dockers$ docker exec -it 76c251e36c26 bash
+root@76c251e36c26:/src/libxml2# clang --version
+clang version 5.0.0 (http://llvm.org/git/clang.git e65ba1f3740b2c95223526d7927bb6cc12a898db) (http://llvm.org/git/llvm.git e460ede847d024abd43b936a2658df24c5bb243c)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /usr/local/bin
+root@76c251e36c26:/src/libxml2#
+
+全部替换
+docker cp 76c251e36c26/usr/local abf2b6973318:/usr
+
+还原，部分替换
+docker cp abf2b6973318/usr/local abf2b6973318:/usr
+docker cp 76c251e36c26/usr/local/bin abf2b6973318:/usr/local
+docker cp 76c251e36c26/usr/local/lib abf2b6973318:/usr/local
+
+结论：clang版本或其他编译链版本问题
+
+
+Fix Commit: 074180119fc90d5fd04ef9e8a5ee1910d6f9ad8e
+Parent Commit: 90ccb58242866b0ba3edbef8fe44214a101c2b3e
+Crash Commit: e905f08123e4a6e7731549e6f09dadff4cab65bd
+📍 Code near error.c:201 at 90ccb582:
+      col = input->cur - cur;
+      /* search forward for end-of-line (to max buff size) */
+      n = 0;
+      ctnt = content;
+      /* copy selected text to our buffer */
+👉    while ((*cur != 0) && (*(cur) != '\n') &&
+           (*(cur) != '\r') && (n < sizeof(content)-1)) {
+                *ctnt++ = *cur++;
+        n++;
+      }
+      *ctnt = 0;
+Files changed in commit:
+diff --git a/SAX2.c b/SAX2.c
+index 5cbb700a..0f0ad2a4 100644
+--- a/SAX2.c
++++ b/SAX2.c
+@@ -2805,7 +2805,8 @@ xmlSAX2CDataBlock(void *ctx, const xmlChar *value, int len)
+        xmlTextConcat(lastChild, value, len);
+     } else {
+        ret = xmlNewCDataBlock(ctxt->myDoc, value, len);
+-       xmlAddChild(ctxt->node, ret);
++       if (xmlAddChild(ctxt->node, ret) == NULL)
++               xmlFreeNode(ret);
+     }
+ }
+
+Diff between e905f08123e4a6e7731549e6f09dadff4cab65bd and 074180119fc90d5fd04ef9e8a5ee1910d6f9ad8e:
+diff --git a/SAX2.c b/SAX2.c
+index 5cbb700a..0f0ad2a4 100644
+--- a/SAX2.c
++++ b/SAX2.c
+@@ -2805,7 +2805,8 @@ xmlSAX2CDataBlock(void *ctx, const xmlChar *value, int len)
+        xmlTextConcat(lastChild, value, len);
+     } else {
+        ret = xmlNewCDataBlock(ctxt->myDoc, value, len);
+-       xmlAddChild(ctxt->node, ret);
++       if (xmlAddChild(ctxt->node, ret) == NULL)
++               xmlFreeNode(ret);
+     }
+ }
+
+diff --git a/elfgcchack.h b/elfgcchack.h
+index 8c52884a..1b81dcde 100644
+--- a/elfgcchack.h
++++ b/elfgcchack.h
+@@ -6547,6 +6547,16 @@ extern __typeof (xmlNoNetExternalEntityLoader) xmlNoNetExternalEntityLoader__int
+ #endif
+ #endif
+
++#ifdef bottom_xmlIO
++#undef xmlNoXxeExternalEntityLoader
++extern __typeof (xmlNoXxeExternalEntityLoader) xmlNoXxeExternalEntityLoader __attribute((alias("xmlNoXxeExternalEntityLoader__internal_alias")));
++#else
++#ifndef xmlNoXxeExternalEntityLoader
++extern __typeof (xmlNoXxeExternalEntityLoader) xmlNoXxeExternalEntityLoader__internal_alias __attribute((visibility("hidden")));
++#define xmlNoXxeExternalEntityLoader xmlNoXxeExternalEntityLoader__internal_alias
++#endif
++#endif
++
+ #ifdef bottom_tree
+ #undef xmlNodeAddContent
+ extern __typeof (xmlNodeAddContent) xmlNodeAddContent __attribute((alias("xmlNodeAddContent__internal_alias")));
+diff --git a/include/libxml/parser.h b/include/libxml/parser.h
+index 47fbec03..63ca1b97 100644
+--- a/include/libxml/parser.h
++++ b/include/libxml/parser.h
+@@ -1111,7 +1111,8 @@ typedef enum {
+     XML_PARSE_HUGE      = 1<<19,/* relax any hardcoded limit from the parser */
+     XML_PARSE_OLDSAX    = 1<<20,/* parse using SAX2 interface before 2.7.0 */
+     XML_PARSE_IGNORE_ENC= 1<<21,/* ignore internal document encoding hint */
+-    XML_PARSE_BIG_LINES = 1<<22 /* Store big lines numbers in text PSVI field */
++    XML_PARSE_BIG_LINES = 1<<22,/* Store big lines numbers in text PSVI field */
++    XML_PARSE_NOXXE    = 1<<23 /* Forbid any external entity loading */
+ } xmlParserOption;
+
+ XMLPUBFUN void XMLCALL
+diff --git a/include/libxml/xmlIO.h b/include/libxml/xmlIO.h
+index 3e41744d..8d3fdef5 100644
+--- a/include/libxml/xmlIO.h
++++ b/include/libxml/xmlIO.h
+@@ -299,6 +299,14 @@ XMLPUBFUN xmlParserInputPtr XMLCALL
+                                         const char *ID,
+                                         xmlParserCtxtPtr ctxt);
+
++/*
++ * A predefined entity loader external entity expansion
++ */
++XMLPUBFUN xmlParserInputPtr XMLCALL
++       xmlNoXxeExternalEntityLoader    (const char *URL,
++                                        const char *ID,
++                                        xmlParserCtxtPtr ctxt);
++
+ /*
+  * xmlNormalizeWindowsPath is obsolete, don't use it.
+  * Check xmlCanonicPath in uri.h for a better alternative.
+diff --git a/include/libxml/xmlerror.h b/include/libxml/xmlerror.h
+index 037c16d5..3036062d 100644
+--- a/include/libxml/xmlerror.h
++++ b/include/libxml/xmlerror.h
+@@ -470,6 +470,7 @@ typedef enum {
+     XML_IO_EADDRINUSE, /* 1554 */
+     XML_IO_EALREADY, /* 1555 */
+     XML_IO_EAFNOSUPPORT, /* 1556 */
++    XML_IO_ILLEGAL_XXE, /* 1557 */
+     XML_XINCLUDE_RECURSION=1600,
+     XML_XINCLUDE_PARSE_VALUE, /* 1601 */
+     XML_XINCLUDE_ENTITY_DEF_MISMATCH, /* 1602 */
+diff --git a/nanohttp.c b/nanohttp.c
+index e109ad75..373425de 100644
+--- a/nanohttp.c
++++ b/nanohttp.c
+@@ -1423,9 +1423,9 @@ retry:
+     if (ctxt->port != 80) {
+        /* reserve space for ':xxxxx', incl. potential proxy */
+        if (proxy)
+-           blen += 12;
++           blen += 17;
+        else
+-           blen += 6;
++           blen += 11;
+     }
+     bp = (char*)xmlMallocAtomic(blen);
+     if ( bp == NULL ) {
+diff --git a/parser.c b/parser.c
+index 53a6b7f0..c2c812de 100644
+--- a/parser.c
++++ b/parser.c
+@@ -8123,6 +8123,15 @@ xmlParsePEReference(xmlParserCtxtPtr ctxt)
+            if (xmlPushInput(ctxt, input) < 0)
+                return;
+        } else {
++           if ((entity->etype == XML_EXTERNAL_PARAMETER_ENTITY) &&
++               ((ctxt->options & XML_PARSE_NOENT) == 0) &&
++               ((ctxt->options & XML_PARSE_DTDVALID) == 0) &&
++               ((ctxt->options & XML_PARSE_DTDLOAD) == 0) &&
++               ((ctxt->options & XML_PARSE_DTDATTR) == 0) &&
++               (ctxt->replaceEntities == 0) &&
++               (ctxt->validate == 0))
++               return;
++
+            /*
+             * TODO !!!
+             * handle the extra spaces added before and after
+@@ -15350,6 +15359,10 @@ xmlCtxtUseOptionsInternal(xmlParserCtxtPtr ctxt, int options, const char *encodi
+        ctxt->options |= XML_PARSE_NONET;
+         options -= XML_PARSE_NONET;
+     }
++    if (options & XML_PARSE_NOXXE) {
++       ctxt->options |= XML_PARSE_NOXXE;
++        options -= XML_PARSE_NOXXE;
++    }
+     if (options & XML_PARSE_COMPACT) {
+        ctxt->options |= XML_PARSE_COMPACT;
+         options -= XML_PARSE_COMPACT;
+diff --git a/xmlIO.c b/xmlIO.c
+index 300ee47a..e6256128 100644
+--- a/xmlIO.c
++++ b/xmlIO.c
+@@ -210,6 +210,7 @@ static const char *IOerr[] = {
+     "adddress in use",         /* EADDRINUSE */
+     "already in use",          /* EALREADY */
+     "unknown address familly", /* EAFNOSUPPORT */
++    "Attempt to load external entity %s", /* XML_IO_ILLEGAL_XXE */
+ };
+
+ #if defined(_WIN32) || defined (__DJGPP__) && !defined (__CYGWIN__)
+@@ -4053,13 +4054,22 @@ xmlDefaultExternalEntityLoader(const char *URL, const char *ID,
+     xmlGenericError(xmlGenericErrorContext,
+                     "xmlDefaultExternalEntityLoader(%s, xxx)\n", URL);
+ #endif
+-    if ((ctxt != NULL) && (ctxt->options & XML_PARSE_NONET)) {
++    if (ctxt != NULL) {
+         int options = ctxt->options;
+
+-       ctxt->options -= XML_PARSE_NONET;
+-        ret = xmlNoNetExternalEntityLoader(URL, ID, ctxt);
+-       ctxt->options = options;
+-       return(ret);
++        if (options & XML_PARSE_NOXXE) {
++            ctxt->options -= XML_PARSE_NOXXE;
++            ret = xmlNoXxeExternalEntityLoader(URL, ID, ctxt);
++            ctxt->options = options;
++            return(ret);
++        }
++
++        if (options & XML_PARSE_NONET) {
++            ctxt->options -= XML_PARSE_NONET;
++            ret = xmlNoNetExternalEntityLoader(URL, ID, ctxt);
++            ctxt->options = options;
++            return(ret);
++        }
+     }
+ #ifdef LIBXML_CATALOG_ENABLED
+     resource = xmlResolveResourceFromCatalog(URL, ID, ctxt);
+@@ -4160,6 +4170,13 @@ xmlNoNetExternalEntityLoader(const char *URL, const char *ID,
+     xmlParserInputPtr input = NULL;
+     xmlChar *resource = NULL;
+
++    if (ctxt == NULL) {
++        return(NULL);
++    }
++    if (ctxt->input_id == 1) {
++        return xmlDefaultExternalEntityLoader((const char *) URL, ID, ctxt);
++    }
++
+ #ifdef LIBXML_CATALOG_ENABLED
+     resource = xmlResolveResourceFromCatalog(URL, ID, ctxt);
+ #endif
+@@ -4182,5 +4199,18 @@ xmlNoNetExternalEntityLoader(const char *URL, const char *ID,
+     return(input);
+ }
+
++xmlParserInputPtr
++xmlNoXxeExternalEntityLoader(const char *URL, const char *ID,
++                          xmlParserCtxtPtr ctxt) {
++    if (ctxt == NULL) {
++        return(NULL);
++    }
++    if (ctxt->input_id == 1) {
++        return xmlDefaultExternalEntityLoader((const char *) URL, ID, ctxt);
++    }
++    xmlIOErr(XML_IO_ILLEGAL_XXE, (const char *) URL);
++    return(NULL);
++}
++
+ #define bottom_xmlIO
+ #include "elfgcchack.h"
+diff --git a/xmllint.c b/xmllint.c
+index 67f7adb2..d9368c1d 100644
+--- a/xmllint.c
++++ b/xmllint.c
+@@ -3019,6 +3019,7 @@ static void usage(const char *name) {
+     printf("\t--path 'paths': provide a set of paths for resources\n");
+     printf("\t--load-trace : print trace of all external entities loaded\n");
+     printf("\t--nonet : refuse to fetch DTDs or entities over network\n");
++    printf("\t--noxxe : forbid any external entity loading\n");
+     printf("\t--nocompact : do not generate compact text nodes\n");
+     printf("\t--htmlout : output results as HTML\n");
+     printf("\t--nowrap : do not put HTML doc wrapper\n");
+@@ -3461,6 +3462,10 @@ main(int argc, char **argv) {
+                    (!strcmp(argv[i], "--nonet"))) {
+            options |= XML_PARSE_NONET;
+            xmlSetExternalEntityLoader(xmlNoNetExternalEntityLoader);
++        } else if ((!strcmp(argv[i], "-noxxe")) ||
++                   (!strcmp(argv[i], "--noxxe"))) {
++           options |= XML_PARSE_NOXXE;
++           xmlSetExternalEntityLoader(xmlNoXxeExternalEntityLoader);
+         } else if ((!strcmp(argv[i], "-nocompact")) ||
+                    (!strcmp(argv[i], "--nocompact"))) {
+            options &= ~XML_PARSE_COMPACT;
+--------------------------------------------------------------------------------
+[*] Parsing crash log to extract file and line number...
+[+] Found crash in function: xmlParserPrintFileContextInternal, file: /src/libxml2/error.c, line: 201
+[+] Bug type: use-of-uninitialized-value
+Crash detected in function: xmlParserPrintFileContextInternal at /src/libxml2/error.c:201 (type: use-of-uninitialized-value)
+[*] Writing prompt to /mnt/sdb/oss-fuzz/arvo/ARVO-Meta/scripts/llm_bug_prompt_42470114.txt...
